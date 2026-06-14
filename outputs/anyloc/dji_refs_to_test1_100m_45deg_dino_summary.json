@@ -1,0 +1,15 @@
+{
+  "queries": 370,
+  "mean_error_m": 120.71725064897973,
+  "median_error_m": 95.19602859661046,
+  "p90_error_m": 243.0269210035785,
+  "max_error_m": 729.5670688567687,
+  "oracle_top_k_mean_error_m": 53.50758776252307,
+  "oracle_top_k_median_error_m": 38.0474145010548,
+  "reference_hits": {
+    "0006": 109,
+    "0008": 186,
+    "0007": 31,
+    "0009": 44
+  }
+}
