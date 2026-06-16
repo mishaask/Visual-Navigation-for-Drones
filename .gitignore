@@ -38,3 +38,45 @@ outputs/anyloc/*.pkl
 .DS_Store
 .idea/
 .vscode/
+
+# Generated processed CSVs/manifests are reproducible from raw SRT/video.
+# Keep only .gitkeep in data/processed.
+data/processed/*.csv
+data/processed/*.json
+!data/processed/.gitkeep
+
+# Realtime sampled query frames are reproducible and can be huge.
+outputs/realtime/**/query_frames/
+outputs/realtime/**/state_match_debug_frames*/
+outputs/realtime/**/*.jpg
+outputs/realtime/**/*.jpeg
+outputs/realtime/**/*.png
+
+# Realtime debug videos are large.
+outputs/realtime/**/*.mp4
+outputs/realtime/**/*.MP4
+outputs/realtime/**/*.avi
+outputs/realtime/**/*.mov
+
+# Realtime per-frame/debug logs are reproducible and can get large.
+outputs/realtime/**/region_anchor_debug.jsonl
+outputs/realtime/**/*.jsonl
+outputs/realtime/**/realtime_predictions.csv
+outputs/realtime/**/raw_realtime_summary.json
+
+# More Python/build/editor noise
+*.egg-info/
+build/
+dist/
+.ipynb_checkpoints/
+Thumbs.db
+tools/run_v7_all_tests.py
+scripts/archive/run_v7_all_tests_autoprep.bat
+scripts/archive/run_v7_all_requested_tests.bat
+scripts/archive/run_realtime_test1_v7_spread_consistency_2fps_debug_around240.bat
+scripts/archive/run_realtime_test1_v6_gap_reacquire_2fps_debug_around240.bat
+scripts/archive/run_realtime_test1_region_anchor_v7_spread_consistency_2fps.bat
+scripts/archive/run_realtime_test1_region_anchor_v6_gap_reacquire_2fps.bat
+scripts/archive/run_final_realtime_test1.bat
+scripts/archive/run_build_reference_regions_v2_test1.bat
+scripts/archive/run_best_pipeline.sh

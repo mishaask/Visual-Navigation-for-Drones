@@ -2,293 +2,259 @@
 
 ## Assignment Objective
 
-The yellow part of the assignment asks us to solve the following optical navigation problem:
+The assignment asks us to solve an optical navigation problem for drones:
 
-Given a reference drone flight with video and telemetry, including GNSS, barometric height, and camera angle, preprocess the data so that a new real-time flight can estimate where the drone camera is looking without using GNSS during inference.
+> Given a reference drone flight with video and telemetry, including GNSS, barometric height, and camera angle, preprocess the data so that a new realtime flight can estimate where the drone camera is looking without using GNSS during inference.
 
-Our concrete output is the GPS coordinate of the center point of the video frame. During evaluation, we compare this estimated coordinate with the coordinate derived from the query flight SRT file.
+The concrete output is the GPS coordinate of the point at the center of the video frame. During evaluation, when the query SRT is available, we compare the estimated coordinate with the SRT-derived camera-center ground coordinate.
+
+The project therefore has two separate requirements:
+
+1. Build a visual/geographic reference map from GNSS-tagged reference flights.
+2. Estimate the camera-center coordinate of a new query video without using the query GNSS during inference.
 
 ## Data Used
 
-Main benchmark:
+### Final realtime benchmark data
 
-| Role | Videos | Drone | Notes |
-| --- | --- | --- | --- |
-| Reference map | `v11`, `v12`, `v13` | DJI Mini 3 Pro | 1080p, 30 fps, about 119 m, 60 degree camera angle |
-| Query/test | `v14` | DJI Mini 3 Pro | GNSS hidden from the algorithm, kept only for evaluation |
+| Role                | Videos                                         | Notes                                                                 |
+| ---                 | ---                                            | ---                                                                   |
+| Reference flights   | `DJI_0006`, `DJI_0007`, `DJI_0008`, `DJI_0009` | Used as the visual map. Each has video and SRT telemetry.             |
+| Leave-one-out tests | `DJI_0006`, `DJI_0007`, `DJI_0008`, `DJI_0009` | Each video is tested while excluded from the reference set.           |
+| Test video with SRT | `DJI_Test1_100m`                               | Used for final quantitative realtime evaluation.                      |
+| No-SRT query        | `DJI_0010_0011_merged`                         | Used as a no-GNSS/no-ground-truth demonstration. Estimated path only. |
 
-Sampling:
-
-- Frames extracted at `1 fps`.
-- SRT telemetry parsed for every video.
-- Ground-truth video-center points computed geometrically from altitude, camera angle, and heading.
-
-Additional validation data:
-
-| Videos | Drone | Result |
-| --- | --- | --- |
-| DJI Air 3 `v1` and `v2` | 45 degree camera angle, gimbal metadata available | Useful for checking geometry, not retained as the main visual localization benchmark |
-
-The Air 3 cross-video visual results were much worse than the Mini 3 Pro benchmark, probably because the two flights differ more strongly in path, scale, and scene coverage.
-
-## Retained Pipeline
-
-The final retained pipeline is:
-
-1. **Parse telemetry**
-
-   `src/telemetry_parser.py` converts DJI SRT files into structured CSV files with frame number, time, latitude, longitude, altitude, and camera metadata when available.
-
-2. **Project the video center onto the ground**
-
-   `src/project_ground_point.py` uses a geometric model:
-
-   - drone GNSS position from SRT,
-   - relative altitude,
-   - camera angle,
-   - heading estimated from the trajectory when yaw is unavailable.
-
-   For the Mini 3 Pro flights, we use a fixed 60 degree camera angle and trajectory-derived heading.
-
-3. **Build frame manifests**
-
-   `src/build_frame_manifest.py` joins each extracted frame with its projected ground coordinate. This creates the reference map and the query/evaluation manifest.
-
-4. **Retrieve candidates with frozen DINOv2**
-
-   `src/frozen_dino_cross_retrieval.py` extracts frozen DINOv2 patch descriptors, mean-pools them into one global descriptor per image, and retrieves the nearest reference frames for each query frame.
-
-5. **Verify candidates with LightGlue**
-
-   `src/temporal_lightglue_rerank.py` runs SuperPoint + LightGlue on the DINOv2 top-k candidates and computes local matching quality.
-
-6. **Select a coherent path with Motion Viterbi**
-
-   `src/motion_viterbi_rerank.py` chooses one candidate per query frame while penalizing unrealistic jumps between consecutive estimated positions.
-
-7. **Export visualization**
-
-   `src/export_google_earth_kml.py` exports the drone path, ground-truth center path, and estimated center path to Google Earth.
-
-## Why AnyLoc Is The Main Paper
-
-The main paper we used is **AnyLoc: Towards Universal Visual Place Recognition**.
-
-AnyLoc fits our problem because it proposes training-free visual place recognition with frozen foundation features, especially DINO/DINOv2. This was important for us because we did not want to train on the same drone videos that are later used for evaluation. In our project, the reference flights are a map/database, not a supervised training set.
-
-We adapted the AnyLoc idea rather than copying the full AnyLoc repository:
-
-- same philosophy: frozen visual features, no finetuning,
-- same family of descriptors: DINOv2 features,
-- same VPR framing: query image against reference database,
-- extra assignment-specific layers: DJI SRT parsing, camera-center projection, LightGlue verification, temporal trajectory selection, KML export.
-
-## Experiments
-
-### 1. DINOv2 Global Retrieval Baseline
-
-Reference: `v11 + v12 + v13`  
-Query: `v14`  
-Sampling: `1 fps`
-
-| Metric | Value |
-| --- | ---: |
-| Queries | 115 |
-| Mean error | 27.28 m |
-| Median error | 20.04 m |
-| P90 error | 57.63 m |
-| Max error | 180.52 m |
-| Oracle top-k mean | 16.65 m |
-| Oracle top-k median | 12.90 m |
-
-Interpretation: DINOv2 often places the correct or near-correct frame inside the candidate list, but the top-1 candidate is not always the best. That justifies reranking.
-
-### 2. DINOv2 + LightGlue
-
-LightGlue checks whether the query and candidate frame share local geometric evidence. This improves many cases where global descriptors retrieve visually similar but wrong places.
-
-| Metric | Value |
-| --- | ---: |
-| Mean error | 19.15 m |
-| Median error | 15.21 m |
-| P90 error | 36.05 m |
-| Max error | 72.53 m |
-
-Interpretation: local matching is a strong improvement over raw DINOv2 retrieval.
-
-### 3. DINOv2 + LightGlue + Motion Viterbi
-
-| Metric | Value |
-| --- | ---: |
-| Queries | 115 |
-| Mean error | 18.83 m |
-| Median error | 15.21 m |
-| P90 error | 36.05 m |
-| Max error | 72.53 m |
-| Improved frames vs DINO | 61 |
-| Worsened frames vs DINO | 29 |
-| Unchanged frames vs DINO | 25 |
-
-Error tolerance breakdown (frames within threshold):
-
-| Threshold | Frames | % of total | Frequency |
-| --- | ---: | ---: | ---: |
-| ≤ 5 m | 14 / 115 | 12.2% | ~1 every 8 s |
-| ≤ 10 m | 37 / 115 | 32.2% | ~1 every 3 s |
-| ≤ 15 m | 56 / 115 | 48.7% | ~1 every 2 s |
-
-Configuration:
-
-- DINO top-k candidates scored with LightGlue.
-- Candidate limit: `6`.
-- Maximum expected step: `20 m`.
-- Transition weight: `4`.
-- Acceleration weight: `0`.
-
-### 4. DINOv2 + LightGlue + Motion Viterbi + Path Smoothing
-
-This is the retained best version.
-
-After Viterbi selection, a Gaussian-weighted moving average (window = 19 frames, σ = 5.4) is applied to the estimated lat/lon trajectory. Isolated wrong retrievals are pulled toward their correct temporal neighbours; the drone's physical continuity constraint prevents oversmoothing from corrupting correct estimates.
-
-| Metric | Value |
-| --- | ---: |
-| Queries | 115 |
-| Mean error | **14.16 m** |
-| Median error | **13.05 m** |
-| P90 error | **25.63 m** |
-| Max error | **38.94 m** |
-
-Improvement over Viterbi alone:
-
-| Metric | Viterbi | + Smoothing | Δ |
-| --- | ---: | ---: | ---: |
-| Mean | 18.83 m | 14.16 m | −4.67 m (−25%) |
-| Median | 15.21 m | 13.05 m | −2.16 m (−14%) |
-| P90 | 36.05 m | 25.63 m | −10.42 m (−29%) |
-| Max | 72.53 m | 38.94 m | −33.59 m (−46%) |
-
-Error tolerance breakdown (frames within threshold):
-
-| Threshold | Frames | % of total | Frequency | Longest gap |
-| --- | ---: | ---: | ---: | ---: |
-| ≤ 5 m | 14 / 115 | 12.2% | ~1 every 8 s | 57 s |
-| ≤ 10 m | 41 / 115 | 35.7% | ~1 every 3 s | 32 s |
-| ≤ 15 m | 68 / 115 | 59.1% | ~1 every 2 s | 20 s |
-
-Compared to the Viterbi-only baseline (≤10m: 32.2%, ≤15m: 48.7%), smoothing adds 4 frames at ≤10m and 12 frames at ≤15m.
-
-The window was selected by sweeping w = 1 to 25 on the evaluation set. The optimum at w = 19 corresponds to ±9 seconds of temporal context at 1 fps, consistent with the drone's travel speed (~7 m/s) and the typical scale of retrieval errors. Oversmoothing above w = 19 degrades the mean as the window exceeds the spatial scale of the correct path segments.
-
-This is the result we present as the main implementation.
-
-### 5. Confidence-Gated Navigation Fixes
-
-The professor suggested that it may be more useful to know how often the system is correct than to force one possibly wrong coordinate every second. We therefore added a confidence-gated evaluation layer.
-
-Instead of always publishing a coordinate, the system can output:
+The all-tests runner writes one output folder per tested video:
 
 ```text
-FIX    if visual evidence is strong enough
-NO_FIX otherwise
+outputs/realtime/DJI_0006/
+outputs/realtime/DJI_0007/
+outputs/realtime/DJI_0008/
+outputs/realtime/DJI_0009/
+outputs/realtime/DJI_Test1_100m/
+outputs/realtime/DJI_0010_0011_merged/
 ```
 
-The retained policy accepts a fix when:
+### Historical offline benchmark data
 
-- `motion_viterbi_rank <= 6`,
-- `lg_inlier_count >= 50`,
-- `lg_inlier_ratio >= 0.70`,
-- `DINO similarity >= 0.98`.
+Earlier experiments used Mini 3 Pro `v11`, `v12`, `v13`, and `v14` flights. These were useful for proving the offline AnyLoc-style pipeline before moving to realtime.
 
-We define a "good fix" as an accepted position whose error is at most `20 m`.
+## Final Retained Realtime Pipeline
 
-| Mode | Coverage | Mean accepted error | Median accepted error | Good fixes <=20m | Mean time between fixes | Longest gap |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Always output | 100.0% | 18.83 m | 15.21 m | 65.2% | 1.00 s | 0.00 s |
-| Confidence gated | 30.4% | 13.67 m | 10.58 m | 80.0% | 2.00 s | 46.01 s |
+The final realtime pipeline is:
 
-Interpretation: the confidence gate improves the reliability of published fixes, but it does not solve the whole navigation problem. It refuses 80 of 115 frames, and the longest period without a fix is about 46 seconds. This is useful as a safety layer: when the visual evidence is weak, the system should abstain instead of publishing a likely wrong coordinate.
+```text
+Region Anchor Spread Consistency
+```
 
-Outputs:
+The main command is:
 
-- `outputs/anyloc/dji_mini3_confidence_gate_sweep.csv`
-- `outputs/anyloc/dji_mini3_confidence_gate_best_decisions.csv`
-- `outputs/anyloc/dji_mini3_confidence_gate_best_summary.json`
+```bat
+scripts\run_v7_all_tests_autoprep.bat
+```
 
-### 6. Air 3 Geometry And Cross-Video Validation
+This command:
 
-The DJI Air 3 data contains richer gimbal metadata, so it helped check the geometric projection step.
+1. builds missing processed manifests
+2. builds reference-region maps
+3. runs the realtime localizer on every requested test video
+4. writes enhanced summaries
+5. exports clean KML files
 
-Geometry comparison using gimbal projection:
+For the final Test1 result, the runner uses:
 
-| Video | Mean shift vs trajectory-heading approximation | Median | P90 | Max |
-| --- | ---: | ---: | ---: | ---: |
-| Air 3 `v1` | 53.04 m | 38.89 m | 129.78 m | 198.33 m |
-| Air 3 `v2` | 10.32 m | 5.65 m | 11.66 m | 84.06 m |
+```text
+data/processed/realtime_reference_regions_v2.csv
+```
 
-Cross-video visual localization was poor:
+This file is built with `--grid-m 90` and `--segment-frame-span 3000`. The newer `reference_regions_all_0006_0009.csv` setup was tested but was not retained for the final Test1 result.
 
-| Direction | Mean error | Median | P90 | Max |
-| --- | ---: | ---: | ---: | ---: |
-| `v1 -> v2` | 161.80 m | 130.60 m | 341.79 m | 446.40 m |
-| `v2 -> v1` | 356.50 m | 419.70 m | 592.07 m | 780.14 m |
+## Pipeline Stages
 
-Interpretation: Air 3 is useful as a geometry sanity check, but not currently a good visual benchmark for our retained method.
+### 1. Parse telemetry
 
-## Rejected Or Non-Retained Attempts
+`src/telemetry_parser.py` converts DJI SRT files into structured CSV files containing frame number, time, latitude, longitude, altitude, and available camera metadata.
 
-We tested several ideas that did not become the official pipeline:
+### 2. Project the video center onto the ground
 
-| Attempt | Outcome |
-| --- | --- |
-| EMA smoothing of estimated coordinates | Sometimes reduced mean slightly, but created delayed paths and was conceptually weaker than selecting a coherent path directly |
-| 2 fps experiments | Added compute cost and complexity without improving the retained result |
-| Rotating/cropping reference frames | Did not beat the current best result |
-| Direction-change penalty | Did not improve the retained metrics enough to justify keeping it as default |
-| DINOv2 VLAD aggregation | Improved raw candidate quality, but did not beat the retained final Motion-Viterbi result |
-| Optical flow dead reckoning | SuperPoint + LightGlue between consecutive query frames estimates speed correctly (785.6 m total path vs 797.3 m GNSS, ~1.5% error), but without heading the cumulative direction error reaches 712 m after 115 frames. Dead reckoning is only viable if a magnetic heading or an initial heading estimate from retrieval is available. See `src/frame_dead_reckoning.py`. |
-| FIX/NO_FIX linear interpolation | Using the confidence gate (30.4% FIX coverage) to select retrieval positions, then linearly interpolating between FIX neighbours for NO_FIX frames. Result: 29.32 m mean, worse than the 18.83 m Viterbi baseline. The gaps are up to 46 s long and the drone path is non-linear, so linear interpolation over a 46 s gap introduces large errors. Viterbi already produces ~21 m mean for NO_FIX frames, outperforming naive interpolation (36 m). See `src/interpolated_navigation.py`. |
+`src/project_ground_point.py` estimates the geographic coordinate of the center of the camera frame using:
 
-The repository has been cleaned so these attempts do not appear as the main path.
+- drone GNSS position from the SRT,
+- relative altitude,
+- fixed camera angle when direct gimbal angle is unavailable,
+- trajectory-derived heading when yaw is unavailable.
 
-## Does This Answer The Assignment?
+For the current data:
 
-Yes, for the main yellow problem:
+- `DJI_0006` to `DJI_0009` use a fixed 60 degree projection.
+- `DJI_Test1_100m` uses a fixed 45 degree projection.
 
-- We preprocess reference flight videos and telemetry.
-- We build a visual reference database with known camera-center coordinates.
-- For a new query video, the algorithm estimates the camera-center coordinate without using query GNSS as an input.
-- We compare the estimated path to the captured SRT path for evaluation.
-- We provide a KML file for visual inspection in Google Earth.
+### 3. Build frame manifests
 
-It also addresses the directions:
+`src/build_frame_manifest.py` joins extracted frames with their projected ground coordinates. These manifests are used both as reference-map entries and as evaluation truth when the query SRT is known.
 
-| Direction | Status |
-| --- | --- |
-| Literature review with open-source paper-with-code | Done in `docs/literature_review.md` |
-| Complete preprocessing and navigation algorithm | Implemented in `src/` and described here |
-| Suitable platform edited for suggested videos | AnyLoc-style DINOv2 + LightGlue VPR stack adapted to DJI SRT videos |
-| Preliminary experiment with path comparison | Done on Mini 3 Pro `v14`, exported as CSV and KML |
+### 4. Build reference regions
+
+`tools/build_reference_regions_v2.py` divides the reference map into spatial regions. Region IDs allow the realtime system to avoid global search after it has acquired a trusted local area.
+
+For leave-one-out tests, the query video is excluded from the region map:
+
+| Query      | Reference region map excludes |
+| ---        | ---        |
+| `DJI_0006` | `DJI_0006` |
+| `DJI_0007` | `DJI_0007` |
+| `DJI_0008` | `DJI_0008` |
+| `DJI_0009` | `DJI_0009` |
+
+### 5. Retrieve visual candidates with frozen DINOv2
+
+DINOv2 descriptors are computed for reference frames and query frames. The reference descriptors are cached, so they do not need to be recomputed for every run.
+
+The DINOv2 descriptor produces the initial top candidates.
+
+### 6. Verify candidates with LightGlue and homography
+
+For each candidate set, SuperPoint + LightGlue finds local feature matches. RANSAC homography then filters matches into geometric inliers and outliers.
+
+This is important because global image retrieval can confuse repeated structures such as roads, buildings, fields, and parking lots.
+
+### 7. Region-anchor realtime tracking
+
+The realtime state logic uses three ideas:
+
+1. **Acquire**: search globally until a region has enough visual/geometric support.
+2. **Lock**: after a good region is accepted, search only nearby regions.
+3. **Reacquire**: if confidence drops, output `NO_ESTIMATE` and widen/globalize search again.
+
+This prevents the system from forcing a coordinate when the visual evidence is weak.
+
+### 8. Optical flow as a short-gap cue only
+
+Optical flow is used as a bounded motion prior, not as a final localization method. Earlier versions showed that optical flow can drift badly when the anchor is wrong. V7 only uses it in restricted cases and prefers `NO_ESTIMATE` during uncertain recovery.
+
+### 9. Spread consistency
+
+V7 adds a spread-consistency check based on LightGlue/RANSAC inliers.
+
+The idea is:
+
+- If query and reference altitude are similar, the matched inlier support should cover a comparable image area.
+- If the inliers are very spread out in one image but collapsed into a tiny patch in the other, the match may be a repeated-object or wrong-viewpoint match.
+- The threshold is altitude-scaled so that different flight heights are handled more fairly.
+
+This reduced accepted-match error on `DJI_Test1_100m`.
+
+## Final Realtime Result
+
+On `DJI_Test1_100m`, the final retained V7 realtime result is:
+
+| Pipeline                            | Evaluated frames | No-estimate frames | Mean    | Median  | P90      | P95      | % under 100 m |
+| ---                                 | ---:             | ---:               | ---:    | ---:    | ---:     | ---:     | ---:          |
+| Region Anchor V7 Spread Consistency | 441              | 298                | 97.78 m | 74.97 m | 229.18 m | 238.34 m | 70.29%        |
+
+## Output Metrics
+
+Each enhanced summary includes:
+
+| Metric        | Meaning |
+| ---           | --- |
+| Mean error    | Average distance between estimated look-at point and SRT-derived look-at point. |
+| Median error  | Middle error value. |
+| P90 error     | 90% of evaluated estimates are at or below this error. |
+| P95 error     | 95% of evaluated estimates are at or below this error. |
+| Max error     | Worst evaluated valid estimate. |
+| % under 100 m | Percentage of valid evaluated estimates at or below 100 m error. |
+| % under 50 m  | Percentage of valid evaluated estimates at or below 50 m error. |
+| % under 10 m  | Percentage of valid evaluated estimates at or below 10 m error. |
+| % under 5 m   | Percentage of valid evaluated estimates at or below 5 m error. |
+| Coverage      | Valid estimates divided by processed frames. |
+| NO_ESTIMATE   | Frames where the system intentionally abstained. |
+
+The percentages are computed over valid evaluated estimates, not all processed frames.
+
+## Final KML Output
+
+For tests with known query SRT, the KML contains:
+
+| Path                              | Color  |
+| ---                               | ---    |
+| Calculated SRT drone path         | Green  |
+| Calculated SRT drone look-at path | Blue   |
+| Estimated drone path              | Red    |
+| Estimated look-at path            | Yellow |
+
+For `DJI_0010_0011_merged`, no SRT truth is available, so the KML contains only:
+
+| Path                   | Color |
+| ---                    | --- |
+| Estimated drone path   | Red |
+| Estimated look-at path | Yellow |
+
+The KML avoids numbered point markers and exports clean path lines.
+
+## Best Offline Result Kept for Comparison
+
+The strongest Test1 result is still the offline/postprocessed pipeline, not the realtime pipeline.
+
+Best offline Test1 result:
+
+| Pipeline                                                 | Mean    | Median  | P90      | Max      |
+| ---                                                      | ---:    | ---:    | ---:     | ---:     |
+| Top25 + Motion Viterbi + segment calibration + smoothing | 53.54 m | 28.53 m | 105.46 m | 362.88 m |
+
+This is more accurate because it uses the whole sequence and postprocessing. It is not the final realtime method, but it is important to report as the best offline result.
+
+## Why We Moved From Offline to Realtime
+
+The offline Viterbi pipeline gives better accuracy because it can see the whole sequence before selecting the final path. But the assignment asks for realtime navigation. A real drone cannot wait until the end of the flight before estimating its location.
+
+The realtime pipeline therefore had to solve additional problems:
+
+- local tracking after acquisition,
+- reacquisition after losing confidence,
+- deciding when to abstain,
+- avoiding stale held coordinates,
+- avoiding optical-flow drift,
+- handling repeated landmarks and viewpoint ambiguity.
+
+## Rejected Or Archived Attempts
+
+The archive folders contain earlier approaches that were useful but not retained as the final pipeline:
+
+| Attempt                          | Reason archived                                                                 |
+| ---                              | ---                                                                             |
+| Greedy realtime visual localizer | Too many jumps and wrong local matches.                                         |
+| State machine v1                 | Locked onto wrong regions and propagated errors.                                |
+| Beam-only localizer              | Useful helpers were retained, but the full pipeline became region-anchor based. |
+| V3/V4 flow-fill                  | Improved coverage but could propagate bad flow during recovery.                 |
+| V5 safe landmark                 | Added safety diagnostics, but V6/V7 improved correctness.                       |
+| V6 gap reacquire                 | Strong baseline, archived after V7 improved accepted-estimate accuracy.         |
 
 ## Limitations
 
-The biggest limitation is viewpoint ambiguity. Drone frames from nearby places can look extremely similar. Trees, parking lots, roads, and buildings repeat across the campus, so raw image retrieval sometimes selects the wrong nearby location.
+The largest limitation is viewpoint ambiguity. A reference frame can show the same object as the query frame but from a different side or distance. That can be visually meaningful but geographically pose-wrong.
 
-The geometry also depends on camera angle and heading. For Mini 3 Pro videos, yaw was not directly available in the SRT, so heading is estimated from the GNSS trajectory during preprocessing/evaluation. Better yaw or gimbal metadata would improve the projected center coordinate.
+The second limitation is the ground-truth projection itself. If gimbal yaw or exact camera angle is missing, the SRT-derived look-at coordinate is approximate. Errors in the projected ground truth affect reported localization error.
 
-The current version is real-time compatible in structure, but the LightGlue step is the compute bottleneck. For real-time deployment, we would keep the reference descriptors precomputed, use a small DINO top-k, and run LightGlue only on a limited candidate set.
+The third limitation is runtime. DINOv2 and LightGlue are expensive. Reference descriptors are cached, but LightGlue verification is still the main bottleneck.
+
+Finally, V7 intentionally lowers coverage. This is a safety choice: the system refuses to publish a coordinate when the visual/geometric evidence is weak.
 
 ## Final Deliverables
 
-| File | Purpose |
-| --- | --- |
-| `README.md` | Build and reproduction guide |
-| `scripts/run_best_pipeline.sh` | One-command reproduction of the retained best pipeline |
-| `docs/literature_review.md` | AnyLoc/DINOv2/LightGlue review |
-| `outputs/anyloc/dji_mini3_cross_v11_v12_v13_to_v14_1fps_motion_viterbi_top6_acc0_results.csv` | Main numerical result |
-| `outputs/maps/dji_mini3_v14_google_earth_best_motion_viterbi.kml` | Google Earth visualization |
-| `outputs/debug/dji_mini3_v14_worst_retrieval_debug.html` | Debug page for the worst retrieval failures |
+| File                                                            | Purpose                                             |
+| ---                                                             | ---                                                 |
+| `README.md`                                                     | Reproduction guide and final pipeline instructions. |
+| `docs/final_report.md`                                          | This final report.                                  |
+| `docs/literature_review.md`                                     | Literature review and method justification.         |
+| `scripts/run_v7_all_tests_autoprep.bat`                         | Main final evaluation command.                      |
+| `tools/run_v7_all_tests_good.py`                                | auto-prep and all-tests runner.                     |
+| `tools/enhance_realtime_summary.py`                             | Adds extra metrics and metric notes.                |
+| `tools/export_final_realtime_kml.py`                            | Exports clean KML paths with requested colors.      |
+| `src/realtime_region_anchor_v7_spread_consistency_localizer.py` | Final realtime localizer.                           |
 
 ## Conclusion
 
-The retained solution is not a trained drone-specific model. It is a clean visual localization pipeline inspired by AnyLoc: frozen DINOv2 descriptors for place recognition, LightGlue for local verification, a temporal motion prior for navigation consistency, and a Gaussian-weighted path smoother. On the main Mini 3 Pro benchmark, it reduces the mean error from 27.28 m (raw DINOv2) to 14.16 m (Viterbi + smoothing w=19) and produces a complete estimated path that can be compared directly with the SRT-derived ground truth.
+The project began with an offline AnyLoc-style visual place recognition pipeline and then evolved into a causal realtime system. The offline pipeline remains the most accurate, with a best Test1 result of 53.54 m mean error after Viterbi, segment calibration, and smoothing. The final realtime pipeline is V7 spread consistency, which improves the accepted-estimate mean error on `DJI_Test1_100m` to 97.78 m while explicitly outputting `NO_ESTIMATE` when confidence is low.
+
+

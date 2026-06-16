@@ -1,232 +1,486 @@
 # Visual Navigation for Drones
 
-This repository contains an easy-to-build implementation for the assignment's main GNSS-denied optical navigation problem:
+GNSS-denied visual navigation for drone video.
 
-> Given a preprocessed reference flight with video and telemetry, estimate in a new flight, without GNSS at inference time, the GPS coordinate of the center point seen by the drone camera.
+This project preprocesses GNSS-tagged reference drone flights into a visual/geographic reference map. Then, for a new query flight, it estimates the geographic coordinate of the point seen at the center of the drone camera without using query GNSS during inference.
 
-The retained solution is an AnyLoc-inspired visual place recognition pipeline. It uses frozen DINOv2 image descriptors to retrieve candidate reference frames, SuperPoint + LightGlue to verify the best candidates locally, and a temporal Viterbi motion prior to choose a coherent path.
+The repository keeps two stages of the work:
 
-## Current Best Result
+1. **Offline/batch localization** — best accuracy, uses the whole query sequence.
+2. **Realtime-style localization** — final realtime pipeline, processes frames causally and can output `NO_ESTIMATE` when uncertain.
 
-Main benchmark:
+---
 
-- Reference database: DJI Mini 3 Pro `v11`, `v12`, `v13`
-- Query/test flight: DJI Mini 3 Pro `v14`
-- Sampling: `1 fps`
-- Target: projected ground coordinate of the video center
+## 1. Quick Start
 
-Best retained result:
+This section is the fastest way to reproduce the final realtime pipeline from a clean clone on Windows.
 
-| Method | Mean error | Median | P90 | Max |
-| --- | ---: | ---: | ---: | ---: |
-| DINOv2 global retrieval | 27.28 m | 20.04 m | 57.63 m | 180.52 m |
-| DINOv2 + LightGlue + Motion Viterbi | 18.83 m | 15.21 m | 36.05 m | 72.53 m |
-| **+ Path smoothing (w=19)** | **14.16 m** | **13.05 m** | **25.63 m** | **38.94 m** |
+### Step 1 — Open the repository
 
-Error tolerance breakdown — best result (Viterbi + smoothing w=19):
-
-| Threshold | Frames | % of total | Frequency |
-| --- | ---: | ---: | ---: |
-| ≤ 5 m | 14 / 115 | 12.2% | ~1 every 8 s |
-| ≤ 10 m | 41 / 115 | 35.7% | ~1 every 3 s |
-| ≤ 15 m | 68 / 115 | 59.1% | ~1 every 2 s |
-
-Main outputs:
-
-- `outputs/anyloc/dji_mini3_cross_v11_v12_v13_to_v14_1fps_motion_viterbi_top6_acc0_results.csv`
-- `outputs/anyloc/dji_mini3_cross_v11_v12_v13_to_v14_1fps_motion_viterbi_top6_acc0_summary.json`
-- `outputs/maps/dji_mini3_v14_google_earth_best_motion_viterbi.kml`
-- `outputs/debug/dji_mini3_v14_worst_retrieval_debug.html`
-
-## Repository Layout
-
-```text
-src/
-  telemetry_parser.py              DJI SRT to structured telemetry CSV
-  project_ground_point.py          geometric camera-center projection
-  build_frame_manifest.py          joins extracted frames with projected coordinates
-  anyloc_dino_retrieval.py         DINOv2 feature extraction and aggregation
-  frozen_dino_cross_retrieval.py   cross-flight visual retrieval
-  temporal_lightglue_rerank.py     LightGlue candidate verification
-  motion_viterbi_rerank.py         retained temporal path selection
-  confidence_gate_results.py       FIX/NO_FIX confidence evaluation
-  smooth_path.py                   Gaussian path smoothing on Viterbi output
-  export_google_earth_kml.py       Google Earth visualization
-  build_retrieval_debug_page.py    worst-error debug HTML
-  analyze_retrieval_failures.py    worst-error CSV extraction
-  make_failure_contact_sheet.py    visual contact sheet for failures
-  dji_mp4_metadata.py              optional DJI MP4 metadata extraction
-  trajectory_report.py             optional GNSS path SVG report
-  projection_report.py             optional camera-center projection SVG report
-  interpolated_navigation.py       negative result: FIX/interp approach (29.32 m, rejected)
-
-data/raw/
-  DJI_v11.SRT, DJI_v12.SRT, DJI_v13.SRT, DJI_v14.SRT
-
-data/processed/
-  DJI_v*_telemetry.csv
-  DJI_v*_ground_projection_60deg.csv
-  DJI_v*_frame_manifest_1fps.csv
-  frames_v*_1fps/
-
-docs/
-  final_report.md
-  literature_review.md
-
-scripts/
-  run_best_pipeline.sh
+```bat
+cd /d "<Your-Repo-Path-Here>"
 ```
 
-## Setup
+### Step 2 — Create and activate the Python environment
 
-Create and activate the environment:
+```bat
+py -3.12 -m venv .venv-anyloc
+call .venv-anyloc\Scripts\activate
+```
 
-```bash
-python3 -m venv .venv-anyloc
-source .venv-anyloc/bin/activate
-pip install --upgrade pip
+After activation, the terminal should show:
+
+```text
+(.venv-anyloc)
+```
+
+### Step 3 — Install Python dependencies
+
+```bat
+python -m pip install --upgrade pip
 pip install -r requirements-anyloc.txt
 ```
 
-The project expects a local DINOv2 checkout and pretrained weights:
+This installs the main computer-vision dependencies, including PyTorch, OpenCV, Kornia, scikit-learn, and LightGlue.
 
-```bash
-git clone https://github.com/facebookresearch/dinov2.git third_party/dinov2
-mkdir -p outputs/models/dinov2
+### Step 4 — Check CUDA / GPU availability
+
+```bat
+python -c "import torch; print(torch.__version__); print('cuda:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO CUDA')"
 ```
 
-Place the DINOv2 ViT-S/14 checkpoint at:
+If CUDA is available, the run will be much faster. If it prints `NO CUDA`, the pipeline can still run, but it will be significantly slower. See the Troubleshooting section below for CUDA notes.
+
+### Step 5 — Check that the final V7 code compiles
+
+```bat
+python -m py_compile src\realtime_region_anchor_v7_spread_consistency_localizer.py
+python -m py_compile tools\run_v7_all_tests_good.py
+python -m py_compile tools\enhance_realtime_summary.py
+python -m py_compile tools\export_final_realtime_kml.py
+```
+
+### Step 6 — Put the raw input files in `data/raw/`
+
+The required files are listed in the "Required Input Files" section below. The important ones are:
+
+```text
+DJI_0006.mp4 / DJI_0006.SRT
+DJI_0007.mp4 / DJI_0007.SRT
+DJI_0008.mp4 / DJI_0008.SRT
+DJI_0009.mp4 / DJI_0009.SRT
+DJI_Test1_100m.MP4 / DJI_Test1_100m.SRT
+DJI_0010_0011_merged.mp4
+```
+
+### Step 7 — Run the full final evaluation
+
+```bat
+scripts\run_v7_all_tests_autoprep.bat
+```
+
+This is the main final command. It automatically prepares missing processed files, builds reference-region maps, runs every requested test, creates enhanced summaries, and exports KML files.
+
+### Optional — Run only the Test1 realtime pipeline
+
+```bat
+scripts\run_final_realtime_test1.bat
+```
+
+This runs only the V7 Test1 pipeline instead of all leave-one-out tests. Use this for a faster sanity check after the project has already been set up.
+
+### Output location
+
+After the run, results are written under:
+
+```text
+outputs/realtime/<query_video_name>/
+```
+
+For example:
+
+```text
+outputs/realtime/DJI_Test1_100m/
+```
+
+Open:
+
+```text
+summary.md
+paths.kml
+```
+
+to inspect the final result.
+
+---
+
+## 2. External Requirements
+
+### Python packages
+
+Install with:
+
+```bat
+pip install -r requirements-anyloc.txt
+```
+
+The main required packages are:
+
+```text
+torch
+torchvision
+pillow
+numpy
+tqdm
+natsort
+einops
+scikit-learn
+tyro
+opencv-python
+kornia
+LightGlue
+```
+
+### FFmpeg
+
+`ffmpeg` is required for frame extraction if frame folders are missing.
+
+Check:
+
+```bat
+ffmpeg -version
+ffprobe -version
+```
+
+If missing:
+
+```bat
+winget install Gyan.FFmpeg
+```
+
+### DINOv2
+
+The project expects a local DINOv2 checkout:
+
+```bat
+git clone https://github.com/facebookresearch/dinov2.git third_party\dinov2
+```
+
+The DINOv2 ViT-S/14 checkpoint must be placed at:
 
 ```text
 outputs/models/dinov2/dinov2_vits14_pretrain.pth
 ```
 
-LightGlue is installed from `requirements-anyloc.txt`.
+Create the folder if needed:
 
-## Rebuild The Data
-
-If frames are missing, extract them at 1 fps:
-
-```bash
-ffmpeg -i data/raw/DJI_v11.mp4 -vf fps=1 data/processed/frames_v11_1fps/frame_%06d.jpg
-ffmpeg -i data/raw/DJI_v12.mp4 -vf fps=1 data/processed/frames_v12_1fps/frame_%06d.jpg
-ffmpeg -i data/raw/DJI_v13.mp4 -vf fps=1 data/processed/frames_v13_1fps/frame_%06d.jpg
-ffmpeg -i data/raw/DJI_v14.mp4 -vf fps=1 data/processed/frames_v14_1fps/frame_%06d.jpg
+```bat
+mkdir outputs\models\dinov2
 ```
 
-Parse SRT telemetry:
+---
 
-```bash
-python src/telemetry_parser.py data/raw/DJI_v11.SRT data/processed/DJI_v11_telemetry.csv
-python src/telemetry_parser.py data/raw/DJI_v12.SRT data/processed/DJI_v12_telemetry.csv
-python src/telemetry_parser.py data/raw/DJI_v13.SRT data/processed/DJI_v13_telemetry.csv
-python src/telemetry_parser.py data/raw/DJI_v14.SRT data/processed/DJI_v14_telemetry.csv
-```
+## 3. Required Input Files
 
-Project the center of the video onto the ground. The Mini 3 Pro flights were documented as 60 degrees at about 119 m, so this benchmark uses a fixed 60 degree camera angle and trajectory-derived heading:
-
-```bash
-python src/project_ground_point.py data/processed/DJI_v11_telemetry.csv data/processed/DJI_v11_ground_projection_60deg.csv --camera-angle-deg 60 --camera-angle-source fixed --heading-source trajectory
-python src/project_ground_point.py data/processed/DJI_v12_telemetry.csv data/processed/DJI_v12_ground_projection_60deg.csv --camera-angle-deg 60 --camera-angle-source fixed --heading-source trajectory
-python src/project_ground_point.py data/processed/DJI_v13_telemetry.csv data/processed/DJI_v13_ground_projection_60deg.csv --camera-angle-deg 60 --camera-angle-source fixed --heading-source trajectory
-python src/project_ground_point.py data/processed/DJI_v14_telemetry.csv data/processed/DJI_v14_ground_projection_60deg.csv --camera-angle-deg 60 --camera-angle-source fixed --heading-source trajectory
-```
-
-Build frame manifests:
-
-```bash
-python src/build_frame_manifest.py data/processed/frames_v11_1fps data/processed/DJI_v11_ground_projection_60deg.csv data/processed/DJI_v11_frame_manifest_1fps.csv --fps 1
-python src/build_frame_manifest.py data/processed/frames_v12_1fps data/processed/DJI_v12_ground_projection_60deg.csv data/processed/DJI_v12_frame_manifest_1fps.csv --fps 1
-python src/build_frame_manifest.py data/processed/frames_v13_1fps data/processed/DJI_v13_ground_projection_60deg.csv data/processed/DJI_v13_frame_manifest_1fps.csv --fps 1
-python src/build_frame_manifest.py data/processed/frames_v14_1fps data/processed/DJI_v14_ground_projection_60deg.csv data/processed/DJI_v14_frame_manifest_1fps.csv --fps 1
-```
-
-## Run The Best Pipeline
-
-```bash
-./scripts/run_best_pipeline.sh
-```
-
-The script recomputes:
-
-1. DINOv2 descriptors and top-k retrieval.
-2. LightGlue verification of DINOv2 candidates.
-3. Motion-Viterbi selection of a coherent estimated path.
-4. Google Earth KML export.
-5. Confidence-gated FIX/NO_FIX evaluation.
-6. Gaussian path smoothing (w=19, σ=5.4) — reduces mean error from 18.83 m to 14.16 m.
-7. Preliminary experiment SVG — three-path comparison (direction 4).
-
-## Confidence-Gated Fixes
-
-The base pipeline outputs one position every second. To answer the question "how often can we be confident that the position is correct?", the confidence-gated evaluation can abstain:
+Place the raw input files in:
 
 ```text
-FIX    if visual evidence is strong enough
-NO_FIX otherwise
+data/raw/
 ```
+
+Required files:
+
+```text
+DJI_0006.mp4
+DJI_0006.SRT
+
+DJI_0007.mp4
+DJI_0007.SRT
+
+DJI_0008.mp4
+DJI_0008.SRT
+
+DJI_0009.mp4
+DJI_0009.SRT
+
+DJI_Test1_100m.MP4
+DJI_Test1_100m.SRT
+
+DJI_0010_0011_merged.mp4
+```
+
+`DJI_0010_0011_merged.mp4` is treated as a no-SRT/no-ground-truth query. It receives estimated paths only.
+
+---
+
+## 4. What the Final Runner Builds Automatically
 
 Run:
 
-```bash
-python src/confidence_gate_results.py \
-  outputs/anyloc/dji_mini3_cross_v11_v12_v13_to_v14_1fps_motion_viterbi_top6_acc0_results.csv \
-  --query-manifest data/processed/DJI_v14_frame_manifest_1fps.csv \
-  --sweep-csv outputs/anyloc/dji_mini3_confidence_gate_sweep.csv \
-  --decisions-csv outputs/anyloc/dji_mini3_confidence_gate_best_decisions.csv \
-  --summary-json outputs/anyloc/dji_mini3_confidence_gate_best_summary.json \
-  --good-error-m 20 \
-  --min-coverage 0.30 \
-  --max-longest-gap-s 60
+```bat
+scripts\run_v7_all_tests_autoprep.bat
 ```
 
-Current retained policy:
+The script calls:
 
-- `motion_viterbi_rank <= 6`
-- `lg_inlier_count >= 50`
-- `lg_inlier_ratio >= 0.70`
-- `DINO similarity >= 0.98`
-
-Result with a 20 m "good fix" threshold:
-
-| Mode | Coverage | Mean accepted error | Good fixes <=20m | Mean time between fixes | Longest gap |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Always output | 100.0% | 18.83 m | 65.2% | 1.00 s | 0.00 s |
-| Confidence gated | 30.4% | 13.67 m | 80.0% | 2.00 s | 46.01 s |
-
-## Preliminary Experiment (Direction 4)
-
-The preliminary experiment answers direction 4: given a video and the camera angle, compute the expected ground-center path and compare it with the pipeline estimate and the SRT-captured path.
-
-Run it standalone (after the pipeline has produced results):
-
-```bash
-python src/preliminary_experiment_report.py \
-  data/processed/DJI_v14_ground_projection_60deg.csv \
-  data/processed/DJI_v14_frame_manifest_1fps.csv \
-  outputs/anyloc/dji_mini3_cross_v11_v12_v13_to_v14_1fps_motion_viterbi_top6_acc0_results.csv \
-  data/processed/DJI_v11_frame_manifest_1fps.csv \
-  data/processed/DJI_v12_frame_manifest_1fps.csv \
-  data/processed/DJI_v13_frame_manifest_1fps.csv \
-  --smoothed-csv outputs/anyloc/dji_mini3_smoothed_results.csv \
-  --output outputs/figures/preliminary_experiment_v14.svg
+```text
+tools/run_v7_all_tests_good.py
 ```
 
-Output: `outputs/figures/preliminary_experiment_v14.svg`
+It automatically creates missing files in `data/processed/`:
 
-The figure overlays three paths in local XY coordinates (metres):
+```text
+DJI_0006_telemetry.csv
+DJI_0006_ground_projection_60deg.csv
+DJI_0006_frame_manifest_1fps.csv
 
-- **Blue dashed** — drone GNSS trajectory from SRT telemetry
-- **Green** — ground-truth camera-center, computed geometrically from altitude + 60° camera angle + trajectory heading
-- **Red** — estimated camera-center from the DINOv2 + LightGlue + Motion Viterbi + Gaussian smoothing (w=19) pipeline
+DJI_0007_telemetry.csv
+DJI_0007_ground_projection_60deg.csv
+DJI_0007_frame_manifest_1fps.csv
 
-Grey lines connect each ground-truth point to its estimate; darker = larger error.
+DJI_0008_telemetry.csv
+DJI_0008_ground_projection_60deg.csv
+DJI_0008_frame_manifest_1fps.csv
 
-## Real-Time Interpretation
+DJI_0009_telemetry.csv
+DJI_0009_ground_projection_60deg.csv
+DJI_0009_frame_manifest_1fps.csv
 
-The retained pipeline is compatible with a real-time version if preprocessing has already built the reference database. In real time, each incoming frame is embedded with frozen DINOv2, compared with the reference descriptors, reranked with LightGlue on a small top-k set, and passed to the temporal selector. GNSS is only used offline to build/evaluate the reference map; it is not used as an input for the query flight estimate.
+DJI_Test1_100m_telemetry.csv
+DJI_Test1_100m_ground_projection_45deg.csv
+DJI_Test1_100m_frame_manifest_1fps.csv
+```
 
-## Reports
+It also builds the reference-region files using `--grid-m 90` and `--segment-frame-span 3000`:
 
-- `docs/final_report.md` explains the assignment mapping, pipeline, experiments, results, and limitations.
-- `docs/literature_review.md` summarizes AnyLoc and the supporting open-source methods used in this project.
+```text
+realtime_reference_regions_v2.csv
+reference_regions_excluding_DJI_0006.csv
+reference_regions_excluding_DJI_0007.csv
+reference_regions_excluding_DJI_0008.csv
+reference_regions_excluding_DJI_0009.csv
+```
+
+`realtime_reference_regions_v2.csv` is the final Test1 reference-region file. The older `reference_regions_all_0006_0009.csv` file is not used for the final Test1 result.
+
+If frame folders are missing, the script uses `ffmpeg` to extract them at 1 FPS.
+
+---
+
+## 5. Tests Performed
+
+The final runner tests:
+
+| Query video            | Reference set                               | Query SRT truth? |
+| ---                    | ---                                         | ---              |
+| `DJI_0006`             | `DJI_0007 + DJI_0008 + DJI_0009`            | Yes              |
+| `DJI_0007`             | `DJI_0006 + DJI_0008 + DJI_0009`            | Yes              |
+| `DJI_0008`             | `DJI_0006 + DJI_0007 + DJI_0009`            | Yes              |
+| `DJI_0009`             | `DJI_0006 + DJI_0007 + DJI_0008`            | Yes              |
+| `DJI_Test1_100m`       | `DJI_0006 + DJI_0007 + DJI_0008 + DJI_0009` | Yes              |
+| `DJI_0010_0011_merged` | `DJI_0006 + DJI_0007 + DJI_0008 + DJI_0009` | No               |
+
+The leave-one-out tests make sure a reference video is not tested against itself.
+
+---
+
+## 6. Output Folders
+
+Every test writes to:
+
+```text
+outputs/realtime/<query_video_name>/
+```
+
+Example:
+
+```text
+outputs/realtime/DJI_0006/
+outputs/realtime/DJI_0007/
+outputs/realtime/DJI_0008/
+outputs/realtime/DJI_0009/
+outputs/realtime/DJI_Test1_100m/
+outputs/realtime/DJI_0010_0011_merged/
+```
+
+Each folder contains:
+
+```text
+realtime_predictions.csv
+raw_realtime_summary.json
+summary.json
+summary.md
+paths.kml
+region_anchor_debug.jsonl
+query_frames/
+```
+
+Use `summary.md` for a readable result summary.
+
+Use `paths.kml` for Google Earth visualization.
+
+---
+
+## 7. KML Color Convention
+
+For tests with known SRT truth:
+
+| Path                                              | Color  |
+| ---                                               | ---    |
+| Calculated SRT drone path                         | Green  |
+| Calculated SRT drone look-at / camera-center path | Blue   |
+| Estimated drone path                              | Red    |
+| Estimated look-at / camera-center path            | Yellow |
+
+For `DJI_0010_0011_merged`, because no query SRT truth is available:
+
+| Path                                   | Color  |
+| ---                                    | ---    |
+| Estimated drone path                   | Red    |
+| Estimated look-at / camera-center path | Yellow |
+
+---
+
+## 8. Summary Metrics
+
+Each `summary.md` and `summary.json` contains:
+
+| Metric        | Meaning                                                                            |
+| ---           | ---                                                                                |
+| Mean error    | Average error distance in metres.                                                  |
+| Median error  | Middle error value.                                                                |
+| P90 error     | 90% of evaluated estimates are at or below this error.                             |
+| P95 error     | 95% of evaluated estimates are at or below this error.                             |
+| Max error     | Worst evaluated valid estimate.                                                    |
+| % under 100 m | Percent of evaluated valid estimates with error ≤ 100 m.                           |
+| % under 50 m  | Percent of evaluated valid estimates with error ≤ 50 m.                            |
+| % under 10 m  | Percent of evaluated valid estimates with error ≤ 10 m.                            |
+| % under 5 m   | Percent of evaluated valid estimates with error ≤ 5 m.                             |
+| Coverage      | Valid estimates divided by total processed frames.                                 |
+| NO_ESTIMATE   | Frames where the system refused to output a coordinate because confidence was low. |
+
+For videos without SRT truth, such as `DJI_0010_0011_merged`, accuracy metrics are marked as unavailable and only estimated paths are exported.
+
+---
+
+## 9. Final Realtime Result
+
+The final retained realtime pipeline is `Region Anchor V7 Spread Consistency` using the old/good reference setup:
+
+```text
+data/processed/realtime_reference_regions_v2.csv
+```
+
+On `DJI_Test1_100m`, the final realtime result is:
+
+| Metric               | Value    |
+| ---                  | ---:     |
+| Frames processed     | 739      |
+| Valid estimates      | 441      |
+| NO_ESTIMATE frames   | 298      |
+| Mean look-at error   | 97.78 m  |
+| Median look-at error | 74.97 m  |
+| P90 look-at error    | 229.18 m |
+| P95 look-at error    | 238.34 m |
+| % under 100 m        | 70.29%   |
+| Coverage             | 59.68%   |
+
+This is the final realtime result. The stronger offline result below is kept only for comparison.
+
+---
+
+## 10. Best Offline Result Kept for Comparison
+
+The strongest Test1 result is still offline/postprocessed, not realtime.
+
+Best offline Test1 result:
+
+| Pipeline                                                 | Mean    | Median  | P90      | Max      |
+| ---                                                      | ---:    | ---:    | ---:     | ---:     |
+| Top25 + Motion Viterbi + segment calibration + smoothing | 53.54 m | 28.53 m | 105.46 m | 362.88 m |
+
+This result is reported for comparison only. It is not the final realtime pipeline.
+---
+
+## 11. Scale / Height Handling
+
+The project handles altitude-induced image scale in two ways.
+
+### V7 spread consistency
+
+V7 checks whether the LightGlue/RANSAC inlier spread is consistent with the query/reference altitude difference. This does not physically change the image; it is a geometric validation rule.
+
+### Optional scale-aware reference manifests
+
+`tools/make_scale_aware_reference_manifest.py` can physically crop and resize reference frames to simulate a target altitude:
+
+```text
+crop_ratio = target_altitude / reference_altitude
+```
+
+This is optional and not enabled by default in the final all-tests runner. It should be used only as a separate experiment unless it beats the normal V7 run.
+
+---
+
+## 12. Main Files
+
+```text
+src/
+  anyloc_dino_retrieval.py
+  build_frame_manifest.py
+  project_ground_point.py
+  realtime_beam_localizer.py
+  realtime_region_anchor_v7_spread_consistency_localizer.py
+  telemetry_parser.py
+
+tools/
+  build_reference_regions_v2.py
+  enhance_realtime_summary.py
+  export_final_realtime_kml.py
+  make_scale_aware_reference_manifest.py
+  run_v7_all_tests_good.py
+
+scripts/
+  run_v7_all_tests_autoprep.bat
+  run_realtime_test1_region_anchor_v7_spread_consistency_2fps.bat
+  run_realtime_test1_v7_spread_consistency_2fps_debug_around240.bat
+```
+
+---
+
+
+## 13. Troubleshooting
+
+### `ModuleNotFoundError: sklearn` or `ModuleNotFoundError: lightglue`
+
+Activate the environment and install requirements:
+
+```bat
+call .venv-anyloc\Scripts\activate
+pip install -r requirements-anyloc.txt
+```
+
+### CUDA is not being used
+
+Check:
+
+```bat
+python -c "import torch; print(torch.__version__); print('cuda:', torch.cuda.is_available())"
+```
+
+If CUDA is false, install a CUDA-enabled PyTorch build appropriate for your machine.
+
+### First run is slow
+
+The first run builds manifests, reference regions, descriptor caches, and LightGlue weights. Later runs reuse caches.
+
+With cuda enabled long videos such as `DJI_0006` and `DJI_0008` can take around 40–45 minutes at 2 FPS because we run LightGlue verification on many sampled frames.
+
+### Run only Test1
+
+For a faster sanity check, run only the final Test1 pipeline:
+
+```bat
+scripts\run_final_realtime_test1.bat
+```
+
